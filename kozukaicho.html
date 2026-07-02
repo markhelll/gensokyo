@@ -170,6 +170,54 @@ function compressImage(file) {
   });
 }
 
+// ── 端末内OCR(Tesseract.js) ──
+let tesseractLoadPromise = null;
+function loadTesseract() {
+  if (window.Tesseract) return Promise.resolve(window.Tesseract);
+  if (tesseractLoadPromise) return tesseractLoadPromise;
+  tesseractLoadPromise = new Promise((resolve, reject) => {
+    const script = document.createElement("script");
+    script.src = "https://cdn.jsdelivr.net/npm/tesseract.js@5/dist/tesseract.min.js";
+    script.onload = () => (window.Tesseract ? resolve(window.Tesseract) : reject(new Error("no Tesseract")));
+    script.onerror = () => reject(new Error("script load failed"));
+    document.head.appendChild(script);
+  });
+  return tesseractLoadPromise;
+}
+
+function extractAmountFromText(text) {
+  const lines = text.split("\n");
+  const priorityWords = ["合計", "ご注文金額", "お支払", "支払金額", "総額", "利用金額", "金額"];
+  const numRe = /([0-9][0-9,]{2,})\s*円/g;
+  for (const line of lines) {
+    if (priorityWords.some((w) => line.includes(w))) {
+      const m = [...line.matchAll(numRe)];
+      if (m.length) return parseInt(m[m.length - 1][1].replace(/,/g, ""), 10);
+    }
+  }
+  const all = [...text.matchAll(numRe)].map((m) => parseInt(m[1].replace(/,/g, ""), 10));
+  if (all.length) return Math.max(...all);
+  const yenRe = /¥\s*([0-9][0-9,]{2,})/g;
+  const allYen = [...text.matchAll(yenRe)].map((m) => parseInt(m[1].replace(/,/g, ""), 10));
+  if (allYen.length) return Math.max(...allYen);
+  return null;
+}
+
+async function runOcr(dataUrl) {
+  const Tesseract = await loadTesseract();
+  let worker;
+  try {
+    worker = await Tesseract.createWorker("jpn+eng");
+    const result = await worker.recognize(dataUrl);
+    const text = (result && result.data && result.data.text) || "";
+    return { amount: extractAmountFromText(text), rawText: text };
+  } finally {
+    if (worker) {
+      try { await worker.terminate(); } catch (e) {}
+    }
+  }
+}
+
 function blankForm() {
   return { date: todayStr(), type: "expense", amount: "", category: EXPENSE_CATS[0], memo: "", photo: null };
 }
@@ -264,6 +312,8 @@ function KozukaichoInner() {
   const [showPaste, setShowPaste] = useState(false);
   const [pasteText, setPasteText] = useState("");
   const [pasteNote, setPasteNote] = useState(null);
+  const [ocrLoading, setOcrLoading] = useState(false);
+  const [ocrNote, setOcrNote] = useState(null);
   const [storageStatus, setStorageStatus] = useState(null); // null | 'ok' | 'load_error' | 'save_error' | 'no_storage'
   const [storageDetail, setStorageDetail] = useState("");
   const fileInputRef = useRef(null);
@@ -421,11 +471,30 @@ function KozukaichoInner() {
     setPasteNote("自動読み取りできませんでした。下の欄に長押しで貼り付けてください。");
   }
 
+  async function tryOcr(dataUrl) {
+    setOcrNote(null);
+    setOcrLoading(true);
+    try {
+      const { amount } = await runOcr(dataUrl);
+      if (amount != null) {
+        setForm((f) => ({ ...f, amount: String(amount) }));
+        setOcrNote(`読み取り: ¥${amount.toLocaleString("ja-JP")}(違ったら直してください)`);
+      } else {
+        setOcrNote("金額を読み取れませんでした。手入力してください。");
+      }
+    } catch (err) {
+      setOcrNote("自動読み取りに失敗しました。手入力してください。");
+    } finally {
+      setOcrLoading(false);
+    }
+  }
+
   async function handleFile(e) {
     const file = e.target.files && e.target.files[0];
     e.target.value = "";
     if (!file) return;
     setEditingId(null);
+    setOcrNote(null);
     let dataUrl;
     try {
       dataUrl = await compressImage(file);
@@ -436,6 +505,7 @@ function KozukaichoInner() {
     }
     setForm({ ...blankForm(), photo: dataUrl });
     setShowForm(true);
+    tryOcr(dataUrl);
   }
 
   function handleSubmit() {
@@ -780,6 +850,15 @@ function KozukaichoInner() {
               <div style={{ marginBottom: 12, borderRadius: 10, overflow: "hidden", border: `1px solid ${PALETTE.rule}` }}>
                 <img src={form.photo} alt="スクショ" style={{ width: "100%", maxHeight: 160, objectFit: "cover", display: "block" }} />
               </div>
+            )}
+
+            {ocrLoading && (
+              <div style={{ display: "flex", alignItems: "center", gap: 8, fontSize: 12, color: PALETTE.textFaint, marginBottom: 10 }}>
+                <Loader2 className="kzk-spin" size={14} /> 端末内で金額を読み取っています…(初回は少し時間がかかります)
+              </div>
+            )}
+            {ocrNote && !ocrLoading && (
+              <div style={{ fontSize: 12, color: PALETTE.income, marginBottom: 10 }}>{ocrNote}</div>
             )}
 
             <div style={{ marginBottom: 14 }}>
