@@ -203,11 +203,14 @@ function extractAmountFromText(text) {
   return null;
 }
 
-async function runOcr(dataUrl) {
+async function runOcr(dataUrl, onStage) {
+  if (onStage) onStage("OCRエンジン読み込み中…");
   const Tesseract = await loadTesseract();
   let worker;
   try {
+    if (onStage) onStage("文字認識の準備中…");
     worker = await Tesseract.createWorker("jpn+eng");
+    if (onStage) onStage("画像を解析中…");
     const result = await worker.recognize(dataUrl);
     const text = (result && result.data && result.data.text) || "";
     return { amount: extractAmountFromText(text), rawText: text };
@@ -472,10 +475,10 @@ function KozukaichoInner() {
   }
 
   async function tryOcr(dataUrl) {
-    setOcrNote(null);
+    setOcrNote("読み取り準備中(ライブラリ読み込み)…");
     setOcrLoading(true);
     try {
-      const { amount } = await runOcr(dataUrl);
+      const { amount } = await runOcr(dataUrl, (stage) => setOcrNote(stage));
       if (amount != null) {
         setForm((f) => ({ ...f, amount: String(amount) }));
         setOcrNote(`読み取り: ¥${amount.toLocaleString("ja-JP")}(違ったら直してください)`);
@@ -483,7 +486,7 @@ function KozukaichoInner() {
         setOcrNote("金額を読み取れませんでした。手入力してください。");
       }
     } catch (err) {
-      setOcrNote("自動読み取りに失敗しました。手入力してください。");
+      setOcrNote(`OCR失敗: ${String(err && (err.message || err))}`);
     } finally {
       setOcrLoading(false);
     }
@@ -854,11 +857,11 @@ function KozukaichoInner() {
 
             {ocrLoading && (
               <div style={{ display: "flex", alignItems: "center", gap: 8, fontSize: 12, color: PALETTE.textFaint, marginBottom: 10 }}>
-                <Loader2 className="kzk-spin" size={14} /> 端末内で金額を読み取っています…(初回は少し時間がかかります)
+                <Loader2 className="kzk-spin" size={14} /> {ocrNote || "読み取り中…"}
               </div>
             )}
             {ocrNote && !ocrLoading && (
-              <div style={{ fontSize: 12, color: PALETTE.income, marginBottom: 10 }}>{ocrNote}</div>
+              <div style={{ fontSize: 12, color: ocrNote.startsWith("OCR失敗") || ocrNote.includes("読み取れません") ? PALETTE.stamp : PALETTE.income, marginBottom: 10 }}>{ocrNote}</div>
             )}
 
             <div style={{ marginBottom: 14 }}>
