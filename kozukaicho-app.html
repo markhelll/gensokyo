@@ -214,7 +214,8 @@ async function runOcr(dataUrl, onStage) {
     const storeJp = extractStoreFromText(jpText, false);
     const store = storeEn || storeJp;
 
-    return { amount, store, rawText: jpText };
+    const storeCandidates = collectStoreCandidates(jpText, enText);
+    return { amount, store, storeCandidates, rawText: jpText };
   } finally {
     if (worker) {
       try { await worker.terminate(); } catch (e) {}
@@ -304,6 +305,32 @@ function extractStoreFromText(text, englishMode) {
   candidates.sort((a, b) => b.score - a.score);
   if (candidates[0].score <= 0) return null;
   return candidates[0].text;
+}
+
+const DEFAULT_MEMO_PRESETS = ["ゲーマーズ", "ASOBI STORE", "メルカリ", "XSOLLA", "paidy", "アニメイト", "とらのあな", "駿河屋", "ライブ物販", "コンビニ"];
+const MEMO_PRESETS_KEY = "kozukaicho-memo-presets";
+
+function collectStoreCandidates(jpText, enText) {
+  const skipRe = /(合計|小計|税込|税抜|消費税|お預|釣|電話|TEL|FAX|〒|住所|様|ご注文|お届け|明細|領収|レシート|注文番号|伝票|支払|クレジット|ご利用|利用速報|カード|VISA|Master|AMEX|ポイント|残高|金額|数量|単価|店舗|レジ|営業|時間|定休)/;
+  const timeRe = /^\d{1,2}[:：]\d{2}/;
+  const dateRe = /\d{4}[-\/年]|\d{1,2}[\/月]\d{1,2}/;
+  const onlySymbol = /^[\d\W_]+$/;
+  const seen = new Set();
+  const out = [];
+  for (const text of [enText, jpText]) {
+    if (!text) continue;
+    for (const line of text.split("\n")) {
+      let clean = line.replace(/\s+/g, " ").trim();
+      clean = clean.replace(/^\d{1,2}[:：]\d{2}\s*/, "").replace(/^[『「【\[\(]\s*/, "").trim();
+      if (clean.length < 2 || clean.length > 24) continue;
+      if (skipRe.test(clean) || timeRe.test(clean) || dateRe.test(clean) || onlySymbol.test(clean)) continue;
+      if (seen.has(clean)) continue;
+      seen.add(clean);
+      out.push(clean);
+      if (out.length >= 6) return out;
+    }
+  }
+  return out;
 }
 
 function blankForm() {
@@ -402,6 +429,10 @@ function KozukaichoInner() {
   const [pasteNote, setPasteNote] = useState(null);
   const [ocrLoading, setOcrLoading] = useState(false);
   const [ocrNote, setOcrNote] = useState(null);
+  const [ocrCandidates, setOcrCandidates] = useState([]);
+  const [memoPresets, setMemoPresets] = useState(DEFAULT_MEMO_PRESETS);
+  const [showPresetEdit, setShowPresetEdit] = useState(false);
+  const [newPreset, setNewPreset] = useState("");
   const [storageStatus, setStorageStatus] = useState(null); // null | 'ok' | 'load_error' | 'save_error' | 'no_storage'
   const [storageDetail, setStorageDetail] = useState("");
   const fileInputRef = useRef(null);
@@ -441,6 +472,16 @@ function KozukaichoInner() {
         }
       } finally {
         setLoaded(true);
+      }
+      // メモ候補プリセットの読み込み
+      try {
+        const pres = await window.storage.get(MEMO_PRESETS_KEY, false);
+        if (pres && pres.value) {
+          const arr = JSON.parse(pres.value);
+          if (Array.isArray(arr) && arr.length) setMemoPresets(arr);
+        }
+      } catch (e) {
+        // 未設定ならデフォルトのまま
       }
     })();
   }, []);
@@ -559,22 +600,42 @@ function KozukaichoInner() {
     setPasteNote("自動読み取りできませんでした。下の欄に長押しで貼り付けてください。");
   }
 
+  async function persistPresets(next) {
+    setMemoPresets(next);
+    try {
+      await window.storage.set(MEMO_PRESETS_KEY, JSON.stringify(next), false);
+    } catch (e) {
+      console.error("kzk: プリセット保存失敗", e);
+    }
+  }
+
+  function addPreset() {
+    const v = newPreset.trim();
+    if (!v || memoPresets.includes(v)) {
+      setNewPreset("");
+      return;
+    }
+    persistPresets([...memoPresets, v]);
+    setNewPreset("");
+  }
+
+  function removePreset(name) {
+    persistPresets(memoPresets.filter((p) => p !== name));
+  }
+
   async function tryOcr(dataUrl) {
     setOcrNote("読み取り準備中(ライブラリ読み込み)…");
+    setOcrCandidates([]);
     setOcrLoading(true);
     try {
-      const { amount, store } = await runOcr(dataUrl, (stage) => setOcrNote(stage));
+      const { amount, storeCandidates } = await runOcr(dataUrl, (stage) => setOcrNote(stage));
+      setOcrCandidates(storeCandidates || []);
       setForm((f) => ({
         ...f,
         amount: amount != null ? String(amount) : f.amount,
-        memo: store || f.memo,
       }));
-      if (amount != null && store) {
-        setOcrNote(`読み取り: ¥${amount.toLocaleString("ja-JP")} / ${store}(違ったら直してください)`);
-      } else if (amount != null) {
-        setOcrNote(`読み取り: ¥${amount.toLocaleString("ja-JP")}(メモは手入力してください)`);
-      } else if (store) {
-        setOcrNote(`メモ候補: ${store}(金額は手入力してください)`);
+      if (amount != null) {
+        setOcrNote(`金額 ¥${amount.toLocaleString("ja-JP")} を読み取りました。メモは下の候補か定番から選べます。`);
       } else {
         setOcrNote("金額を読み取れませんでした。手入力してください。");
       }
@@ -1061,8 +1122,80 @@ function KozukaichoInner() {
               value={form.memo}
               onChange={(e) => setForm((f) => ({ ...f, memo: e.target.value }))}
               placeholder="任意"
-              style={{ ...inputStyle, marginBottom: 20 }}
+              style={{ ...inputStyle, marginBottom: 8 }}
             />
+
+            {ocrCandidates.length > 0 && (
+              <div style={{ marginBottom: 8 }}>
+                <div style={{ fontSize: 10, color: PALETTE.textFaint, marginBottom: 4 }}>読み取り候補(タップで入力)</div>
+                <div style={{ display: "flex", flexWrap: "wrap", gap: 6 }}>
+                  {ocrCandidates.map((c, i) => (
+                    <button
+                      key={i}
+                      className="kzk-btn"
+                      onClick={() => setForm((f) => ({ ...f, memo: c }))}
+                      style={{ padding: "5px 10px", borderRadius: 999, fontSize: 12, border: `1px solid ${PALETTE.income}`, background: "transparent", color: PALETTE.income, maxWidth: "100%", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}
+                    >
+                      {c}
+                    </button>
+                  ))}
+                </div>
+              </div>
+            )}
+
+            <div style={{ marginBottom: 20 }}>
+              <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 4 }}>
+                <span style={{ fontSize: 10, color: PALETTE.textFaint }}>定番(タップで入力)</span>
+                <button
+                  className="kzk-btn"
+                  onClick={() => setShowPresetEdit((v) => !v)}
+                  style={{ fontSize: 10, color: PALETTE.textFaint, background: "none", border: "none", textDecoration: "underline" }}
+                >
+                  {showPresetEdit ? "完了" : "編集"}
+                </button>
+              </div>
+              <div style={{ display: "flex", flexWrap: "wrap", gap: 6 }}>
+                {memoPresets.map((p) => (
+                  <span key={p} style={{ display: "inline-flex", alignItems: "center" }}>
+                    <button
+                      className="kzk-btn"
+                      onClick={() => !showPresetEdit && setForm((f) => ({ ...f, memo: p }))}
+                      style={{ padding: "5px 10px", borderRadius: showPresetEdit ? "999px 0 0 999px" : 999, fontSize: 12, border: `1px solid ${PALETTE.rule}`, background: PALETTE.paperDark, color: PALETTE.text }}
+                    >
+                      {p}
+                    </button>
+                    {showPresetEdit && (
+                      <button
+                        className="kzk-btn"
+                        onClick={() => removePreset(p)}
+                        style={{ padding: "5px 8px", borderRadius: "0 999px 999px 0", fontSize: 12, border: `1px solid ${PALETTE.stamp}`, borderLeft: "none", background: "transparent", color: PALETTE.stamp }}
+                        aria-label="削除"
+                      >
+                        ×
+                      </button>
+                    )}
+                  </span>
+                ))}
+              </div>
+              {showPresetEdit && (
+                <div style={{ display: "flex", gap: 6, marginTop: 8 }}>
+                  <input
+                    type="text"
+                    value={newPreset}
+                    onChange={(e) => setNewPreset(e.target.value)}
+                    placeholder="定番を追加(店名など)"
+                    style={{ ...inputStyle, marginBottom: 0, fontSize: 12, padding: "8px 10px" }}
+                  />
+                  <button
+                    className="kzk-btn"
+                    onClick={addPreset}
+                    style={{ flexShrink: 0, padding: "8px 14px", borderRadius: 8, border: "none", background: PALETTE.ink, color: PALETTE.paper, fontSize: 12, fontWeight: 700 }}
+                  >
+                    追加
+                  </button>
+                </div>
+              )}
+            </div>
 
             <div style={{ display: "flex", gap: 10 }}>
               {editingId && (
