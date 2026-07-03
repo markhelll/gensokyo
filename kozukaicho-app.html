@@ -192,10 +192,29 @@ async function runOcr(dataUrl, onStage) {
   try {
     if (onStage) onStage("文字認識の準備中…");
     worker = await Tesseract.createWorker("jpn+eng");
-    if (onStage) onStage("画像を解析中…");
-    const result = await worker.recognize(dataUrl);
-    const text = (result && result.data && result.data.text) || "";
-    return { amount: extractAmountFromText(text), store: extractStoreFromText(text), rawText: text };
+
+    if (onStage) onStage("画像を解析中(日本語)…");
+    const jpResult = await worker.recognize(dataUrl);
+    const jpText = (jpResult && jpResult.data && jpResult.data.text) || "";
+
+    // 英字ブランド名の誤読を減らすため、英語のみでもう一度読む
+    if (onStage) onStage("画像を解析中(英語)…");
+    let enText = "";
+    try {
+      await worker.reinitialize("eng");
+      const enResult = await worker.recognize(dataUrl);
+      enText = (enResult && enResult.data && enResult.data.text) || "";
+    } catch (e) {
+      // 英語エンジン失敗時は日本語結果だけで続行
+    }
+
+    const amount = extractAmountFromText(jpText);
+    // 店名は英語結果を優先しつつ、良い候補が無ければ日本語結果で補完
+    const storeEn = extractStoreFromText(enText, true);
+    const storeJp = extractStoreFromText(jpText, false);
+    const store = storeEn || storeJp;
+
+    return { amount, store, rawText: jpText };
   } finally {
     if (worker) {
       try { await worker.terminate(); } catch (e) {}
@@ -232,7 +251,8 @@ function extractAmountFromText(text) {
   return null;
 }
 
-function extractStoreFromText(text) {
+function extractStoreFromText(text, englishMode) {
+  if (!text) return null;
   const rawLines = text.split("\n").map((l) => l.trim()).filter((l) => l.length > 0);
 
   // 明らかにノイズな行を除外
@@ -244,7 +264,6 @@ function extractStoreFromText(text) {
   const candidates = [];
   for (const line of rawLines) {
     let clean = line.replace(/\s+/g, " ").trim();
-    // 行頭の時刻や記号を剥がす
     clean = clean.replace(/^\d{1,2}[:：]\d{2}\s*/, "").replace(/^[『「【\[\(]\s*/, "").trim();
     if (clean.length < 2 || clean.length > 30) continue;
     if (skipRe.test(clean)) continue;
@@ -252,20 +271,30 @@ function extractStoreFromText(text) {
     if (dateRe.test(clean)) continue;
     if (onlySymbol.test(clean)) continue;
 
-    // スコアリング: 店名/商品名らしさ
     let score = 0;
-    // アルファベット大文字が続く(XSOLLA, ASOBI STORE等ブランド名)
-    if (/[A-Z]{3,}/.test(clean)) score += 5;
-    // カタカナ列(商品名に多い)
-    if (/[ァ-ヴー]{3,}/.test(clean)) score += 3;
-    // 漢字を含む(店名・商品名)
-    if (/[一-龠]{2,}/.test(clean)) score += 2;
-    // 英字ブランド名
-    if (/[A-Za-z]{4,}/.test(clean)) score += 2;
-    // 記号や数字が多い行は減点
+    if (englishMode) {
+      // 英語モード: 連続した大文字英字ブランド名(XSOLLA, ASOBI STORE等)を強く優先
+      const upperMatch = clean.match(/\b[A-Z][A-Z]{2,}\b/);
+      if (upperMatch) {
+        score += 10;
+        // ブランド名だけを抜き出す(周囲のノイズ除去)
+        const brandOnly = clean.match(/\b[A-Z][A-Za-z]{2,}(?:\s+[A-Z][A-Za-z]+)?\b/);
+        if (brandOnly) clean = brandOnly[0];
+      } else if (/[A-Za-z]{4,}/.test(clean)) {
+        score += 3;
+      } else {
+        continue; // 英語モードでは英字が無い行はスキップ
+      }
+    } else {
+      // 日本語モード
+      if (/[A-Z]{3,}/.test(clean)) score += 5;
+      if (/[ァ-ヴー]{3,}/.test(clean)) score += 3;
+      if (/[一-龠]{2,}/.test(clean)) score += 2;
+      if (/[A-Za-z]{4,}/.test(clean)) score += 2;
+    }
+
     const symbolRatio = (clean.replace(/[^\d\W_]/g, "").length) / clean.length;
     if (symbolRatio > 0.4) score -= 3;
-    // 短すぎ・長すぎを微調整(8〜20文字がちょうどいい)
     if (clean.length >= 4 && clean.length <= 20) score += 1;
 
     candidates.push({ text: clean, score });
@@ -273,7 +302,6 @@ function extractStoreFromText(text) {
 
   if (candidates.length === 0) return null;
   candidates.sort((a, b) => b.score - a.score);
-  // スコアが低すぎる(ノイズしかない)場合はnull
   if (candidates[0].score <= 0) return null;
   return candidates[0].text;
 }
